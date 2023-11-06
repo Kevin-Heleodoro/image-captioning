@@ -532,3 +532,182 @@ class ImageCaptioningModel(keras.Model):
         accuracy = tf.cast(accuracy, dtype=tf.float32)
         mask = tf.cast(mask, dtype=tf.float32)
         return tf.reduce_sum(accuracy) / tf.reduce_sum(mask)
+
+    def _compute_caption_loss_and_acc(self, img_embed, batch_seq, training=True):
+        encoder_out = self.encoder(img_embed, training=training)
+        batch_seq_inp = batch_seq[:, :-1]
+        batch_seq_true = batch_seq[:, 1:]
+        mask = tf.math.not_equal(batch_seq_true, 0)
+        batch_seq_pred = self.decoder(
+            batch_seq_inp, encoder_out, training=training, mask=mask
+        )
+        loss = self.calculate_loss(batch_seq_true, batch_seq_pred, mask)
+        acc = self.calculate_accuracy(batch_seq_true, batch_seq_pred, mask)
+        return loss, acc
+
+    def train_step(self, batch_data):
+        batch_img, batch_seq = batch_data
+        batch_loss = 0
+        batch_acc = 0
+
+        if self.image_aug:
+            batch_img = self.image_aug(batch_img)
+
+        # Get image embedding
+        img_embed = self.cnn_model(batch_img)
+
+        # Pass each of the 5 captions to decoder
+        # with encoder outputs and compute loss & accuracy
+        # for each caption
+        for i in range(self.num_captions_per_image):
+            with tf.GradientTape() as tape:
+                loss, acc = self._compute_caption_loss_and_acc(
+                    img_embed, batch_seq[:, i, :], training=True
+                )
+
+                # Update loss and accuracy
+                batch_loss += loss
+                batch_acc += acc
+
+            # Get list of all trainable weights
+            train_vars = (
+                self.encoder.trainable_variables + self.decoder.trainable_variables
+            )
+
+            # Get gradients
+            grads = tape.gradient(loss, train_vars)
+
+            # Update trainable weights
+            self.optimizer.apply_gradients(zip(grads, train_vars))
+
+        # Update trackers
+        batch_acc /= float(self.num_captions_per_image)
+        self.loss_tracker.update_state(batch_loss)
+        self.acc_tracker.update_state(batch_acc)
+
+        return {"loss": self.loss_tracker.result(), "acc": self.acc_tracker.result()}
+
+    def test_step(self, batch_data):
+        batch_img, batch_seq = batch_data
+        batch_loss = 0
+        batch_acc = 0
+
+        # Get image embeddings
+        img_embed = self.cnn_model(batch_img)
+
+        for i in range(self.num_captions_per_image):
+            loss, acc = self._compute_caption_loss_and_acc(
+                img_embed, batch_seq[:, i, :], training=False
+            )
+
+            batch_loss += loss
+            batch_acc += acc
+
+        batch_acc /= float(self.num_captions_per_image)
+
+        self.loss_tracker.update_state(batch_loss)
+        self.acc_tracker.update_state(batch_acc)
+
+        return {"loss": self.loss_tracker.result(), "acc": self.acc_tracker.result()}
+
+    @property
+    def metrics(self):
+        return [self.loss_tracker, self.acc_tracker]
+
+
+cnn_model = get_cnn_model()
+encoder = TransformerEncoderBlock(embed_dim=EMBED_DIM, dense_dim=FF_DIM, num_heads=1)
+decoder = TransformerDecoderBlock(embed_dim=EMBED_DIM, ff_dim=FF_DIM, num_heads=2)
+caption_model = ImageCaptioningModel(
+    cnn_model=cnn_model, encoder=encoder, decoder=decoder, image_aug=image_augmentation
+)
+
+
+"""
+Model Training
+"""
+
+# Loss function
+cross_entropy = keras.losses.SparseCategoricalCrossentropy(
+    from_logits=False, reduction="none"
+)
+
+# EarlyStopping criteria
+early_stopping = keras.callbacks.EarlyStopping(patience=3, restore_best_weights=True)
+
+
+# Learning Rate Scheduler for optimizer
+class LRSchedule(keras.optimizers.schedules.LearningRateSchedule):
+    def __init__(self, post_warmup_learning_rate, warmup_steps):
+        super().__init__()
+        self.post_warmup_learning_rate = post_warmup_learning_rate
+        self.warmup_steps = warmup_steps
+
+    def __call__(self, step):
+        global_step = tf.cast(step, tf.float32)
+        warmup_steps = tf.cast(self.warmup_steps, tf.float32)
+        warmup_progress = global_step / warmup_steps
+        warmup_learning_rate = self.post_warmup_learning_rate * warmup_progress
+        return tf.cond(
+            global_step < warmup_steps,
+            lambda: warmup_learning_rate,
+            lambda: self.post_warmup_learning_rate,
+        )
+
+
+# Create Learning Rate Scheduler
+num_train_steps = len(train_dataset) * EPOCHS
+num_warmup_steps = num_train_steps // 15
+lr_schedule = LRSchedule(post_warmup_learning_rate=1e-4, warmup_steps=num_warmup_steps)
+
+# Compile model
+caption_model.compile(optimizer=keras.optimizers.Adam(lr_schedule), loss=cross_entropy)
+
+# Fit the model
+caption_model.fit(
+    train_dataset,
+    epochs=EPOCHS,
+    validation_data=valid_dataset,
+    callbacks=[early_stopping],
+)
+
+vocab = vectorization.get_vocabulary()
+index_lookup = dict(zip(range(len(vocab)), vocab))
+max_decoded_sentence_length = MAX_SEQ_LENGTH - 1
+valid_images = list(valid_data.keys())
+
+
+def generate_caption():
+    sample_img = np.random.choice(valid_images)
+
+    sample_img = decode_and_resize(sample_img)
+    img = sample_img.numpy().clip(0, 255).astype(np.uint8)
+    plt.imshow(img)
+    plt.show()
+
+    img = tf.expand_dims(sample_img, 0)
+    img = caption_model.cnn_model(img)
+
+    encoded_img = caption_model.encoder(img, training=False)
+
+    decoded_caption = "<start> "
+    for i in range(max_decoded_sentence_length):
+        tokenized_caption = vectorization([decoded_caption])[:, :-1]
+        mask = tf.math.not_equal(tokenized_caption, 0)
+        predictions = caption_model.decoder(
+            tokenized_caption, encoded_img, training=False, mask=mask
+        )
+        sampled_token_index = np.argmax(predictions[0, i, :])
+        sampled_token = index_lookup[sampled_token_index]
+        if sampled_token == "<end>":
+            break
+        decoded_caption += " " + sampled_token
+
+    decoded_caption = decoded_caption.replace("<start> ", "")
+    decoded_caption = decoded_caption.replace("<end>", "").strip()
+    print("Predicted Caption: ", decoded_caption)
+
+
+generate_caption()
+generate_caption()
+generate_caption()
